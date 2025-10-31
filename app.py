@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 from sqlalchemy import create_engine, text, inspect
 import plotly.express as px
+import joblib
+import io
 
 # --------------------------------------------------
 # 🎯 Streamlit Configuration
@@ -50,12 +52,31 @@ def predict_with_sagemaker(payload: dict):
         return None
 
 
-# --------------------------------------------------
-# 🔐 RDS Connection via AWS Secrets Manager
-# --------------------------------------------------
+# --------------------------
+# 🧠 Load Model from S3
+# --------------------------
+@st.cache_resource
+def load_model_from_s3(bucket="healthcarepatientrecords25"):
+    s3 = boto3.client("s3")
+    try:
+        model_obj = s3.get_object(Bucket=bucket, Key="models/patient_risk_model.pkl")
+        cols_obj = s3.get_object(Bucket=bucket, Key="models/model_columns.pkl")
+
+        model = joblib.load(io.BytesIO(model_obj["Body"].read()))
+        model_columns = joblib.load(io.BytesIO(cols_obj["Body"].read()))
+        return model, model_columns
+    except Exception as e:
+        st.error(f"❌ Model could not be loaded from S3: {e}")
+        st.stop()
+
+model, model_columns = load_model_from_s3()
+
+# --------------------------
+# 🔐 RDS Connection
+# --------------------------
 @st.cache_resource
 def get_engine():
-    secret_name = "patientriskdb/credentials"  # Secret in Secrets Manager
+    secret_name = "patientriskdb/credentials"  # You can store this in st.secrets for security
     region_name = "ap-south-1"
     try:
         client = boto3.client("secretsmanager", region_name=region_name)
@@ -67,7 +88,6 @@ def get_engine():
             f"{engine_type}://{secret['username']}:{secret['password']}@{secret['host']}/{db_name}"
         )
 
-        # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return engine
@@ -77,11 +97,11 @@ def get_engine():
 
 engine = get_engine()
 
-
-# --------------------------------------------------
-# 🧱 Ensure Table Exists
-# --------------------------------------------------
+# --------------------------
+# 🧱 Ensure Table Schema Exists
+# --------------------------
 def ensure_table_schema(engine):
+    """Ensure the patient_predictions table exists with the required columns"""
     required_columns = {
         "patient_id": "VARCHAR(50)",
         "age": "INT",
@@ -119,57 +139,90 @@ def ensure_table_schema(engine):
     try:
         inspector = inspect(engine)
         with engine.connect() as conn:
+            # Create table if not exists
             conn.execute(text(create_table_sql))
             conn.commit()
 
+            # Add any missing columns dynamically
             existing_cols = [col["name"] for col in inspector.get_columns("patient_predictions")]
             for col, dtype in required_columns.items():
                 if col not in existing_cols:
-                    conn.execute(text(f"ALTER TABLE patient_predictions ADD COLUMN {col} {dtype};"))
+                    alter_sql = f"ALTER TABLE patient_predictions ADD COLUMN {col} {dtype};"
+                    conn.execute(text(alter_sql))
                     conn.commit()
-        st.success("✅ Table schema verified.")
+        st.success("✅ Table schema verified and ready.")
     except Exception as e:
-        st.error(f"❌ Failed to ensure schema: {e}")
+        st.error(f"❌ Failed to ensure table schema: {e}")
         st.stop()
 
 ensure_table_schema(engine)
 
-
-# --------------------------------------------------
-# 🧭 Sidebar Navigation
-# --------------------------------------------------
+# --------------------------
+# 🧮 Sidebar Navigation
+# --------------------------
 menu = st.sidebar.radio("Navigation", ["Predict Risk", "Analytics Dashboard"])
 st.sidebar.markdown("---")
-st.sidebar.info("AI model powered by AWS SageMaker & RandomForest")
+st.sidebar.info("AI model powered by RandomForest & AWS")
 
-
-# --------------------------------------------------
-# 🩺 Prediction Page
-# --------------------------------------------------
+# --------------------------
+# 💉 PREDICT RISK
+# --------------------------
 if menu == "Predict Risk":
-    st.markdown("<div class='title'>🏥 Patient Risk Prediction</div>", unsafe_allow_html=True)
-    st.markdown("Enter patient details below to predict hospital readmission risk:")
+    st.markdown('<p class="title">💉 Patient Readmission Risk Prediction</p>', unsafe_allow_html=True)
+    st.caption("Enter patient data below to estimate readmission risk.")
 
-    with st.form("prediction_form"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
+    with st.form("predict_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
             age = st.number_input("Age", 0, 120, 45)
-            heart_rate = st.number_input("Heart Rate", 40, 200, 85)
+            heart_rate = st.number_input("Heart Rate", 30, 200, 78)
+        with c2:
+            bp_systolic = st.number_input("Systolic BP", 80, 200, 125)
+            bp_diastolic = st.number_input("Diastolic BP", 40, 120, 82)
+        with c3:
             hemoglobin = st.number_input("Hemoglobin", 5.0, 20.0, 13.5)
-        with col2:
-            bp_systolic = st.number_input("BP Systolic", 80, 200, 120)
-            bp_diastolic = st.number_input("BP Diastolic", 50, 120, 80)
-            length_of_stay = st.number_input("Length of Stay (days)", 0, 100, 3)
-        with col3:
-            gender = st.selectbox("Gender", ["Male", "Female"])
-            race = st.selectbox("Race", ["Caucasian", "AfricanAmerican", "Asian", "Hispanic", "Other"])
-            diagnosis = st.text_input("Diagnosis", "Diabetes")
+            length_of_stay = st.number_input("Hospital Stay (days)", 0, 60, 4)
 
-        submitted = st.form_submit_button("🔍 Predict Risk")
+        gender = st.selectbox("Gender", ["Male", "Female"])
+        race = st.selectbox("Race", ["Caucasian", "AfricanAmerican", "Asian", "Hispanic", "Other"])
+        diagnosis = st.selectbox("Diagnosis", ["Diabetes", "Heart Disease", "Kidney Disease", "Other"])
+        patient_id = st.text_input("Patient ID", value="P001")
+
+        submitted = st.form_submit_button("🚀 Predict")
 
     if submitted:
-        input_payload = {
-            "instances": [{
+        try:
+            input_data = pd.DataFrame({
+                "age": [age],
+                "heart_rate": [heart_rate],
+                "bp_systolic": [bp_systolic],
+                "bp_diastolic": [bp_diastolic],
+                "hemoglobin": [hemoglobin],
+                "length_of_stay": [length_of_stay],
+                "gender": [gender],
+                "race": [race],
+                "diagnosis": [diagnosis],
+            })
+
+            input_data = pd.get_dummies(input_data)
+            input_data = input_data.reindex(columns=model_columns, fill_value=0)
+
+            pred = model.predict(input_data)[0]
+            prob = model.predict_proba(input_data)[:, 1][0]
+            label = "High Risk" if pred == 1 else "Low Risk"
+
+            color = "#ffe5e5" if pred == 1 else "#e8f8f5"
+            icon = "⚠️" if pred == 1 else "✅"
+            st.markdown(f"""
+                <div class="risk-box" style="background-color:{color}">
+                    <h3>{icon} {label}</h3>
+                    <p>Probability: {prob*100:.2f}%</p>
+                </div>
+            """, unsafe_allow_html=True)
+            st.progress(prob)
+
+            record = pd.DataFrame([{
+                "patient_id": patient_id,
                 "age": age,
                 "heart_rate": heart_rate,
                 "bp_systolic": bp_systolic,
@@ -178,46 +231,17 @@ if menu == "Predict Risk":
                 "length_of_stay": length_of_stay,
                 "gender": gender,
                 "race": race,
-                "diagnosis": diagnosis
-            }]
-        }
+                "diagnosis": diagnosis,
+                "risk_score": float(prob),
+                "prediction_label": label,
+                "timestamp": pd.Timestamp.now(tz="UTC")
+            }])
 
-        st.info("Sending data to SageMaker endpoint...")
-        result = predict_with_sagemaker(input_payload)
+            record.to_sql("patient_predictions", engine, if_exists="append", index=False)
+            st.success("💾 Prediction saved to database.")
 
-        if result:
-            prediction = result.get("predictions", [0])[0]
-            prob = result.get("probabilities", [0.0])[0]
-
-            label = "High Risk" if prediction == 1 else "Low Risk"
-            color = "#ff4d4d" if prediction == 1 else "#2ecc71"
-
-            st.markdown(f"""
-                <div class='risk-box' style='background-color:{color}1A'>
-                    <h3 style='color:{color};'>Prediction: {label}</h3>
-                    <p><strong>Risk Probability:</strong> {prob:.2%}</p>
-                </div>
-            """, unsafe_allow_html=True)
-
-            # Save to RDS
-            try:
-                with engine.connect() as conn:
-                    conn.execute(text("""
-                        INSERT INTO patient_predictions (
-                            patient_id, age, heart_rate, bp_systolic, bp_diastolic, hemoglobin,
-                            length_of_stay, gender, race, diagnosis, risk_score, prediction_label, timestamp
-                        ) VALUES (:pid, :age, :hr, :bps, :bpd, :hgb, :los, :gender, :race, :diag, :score, :label, :ts)
-                    """), {
-                        "pid": f"P{int(datetime.now().timestamp())}",
-                        "age": age, "hr": heart_rate, "bps": bp_systolic, "bpd": bp_diastolic,
-                        "hgb": hemoglobin, "los": length_of_stay, "gender": gender, "race": race,
-                        "diag": diagnosis, "score": prob, "label": label, "ts": datetime.now()
-                    })
-                    conn.commit()
-                st.success("✅ Prediction logged to database.")
-            except Exception as e:
-                st.warning(f"⚠️ Failed to save to database: {e}")
-
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
 
 # --------------------------
 # 📊 ANALYTICS DASHBOARD
